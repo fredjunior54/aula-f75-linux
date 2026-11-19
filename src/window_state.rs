@@ -33,6 +33,14 @@ impl Default for WindowState {
 }
 
 impl WindowState {
+    pub(crate) fn hidden() -> Self {
+        Self {
+            phase: Phase::Hidden,
+            want_visible: false,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn is_visible(&self) -> bool {
         matches!(self.phase, Phase::Visible | Phase::Closing)
     }

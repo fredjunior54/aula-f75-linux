@@ -1508,13 +1508,24 @@ pub fn preset_rainbow(c: &mut Colours) {
     }
 }
 
-pub fn run() -> anyhow::Result<()> {
-    if crate::instance::signal("show") {
-        return Ok(()); // already running: it brings its window up
-    }
-    let core = Core::start(&Profile::active());
-    crate::instance::listen(core.clone());
+pub fn run(tray_only: bool) -> anyhow::Result<()> {
+    let message = if tray_only { "ping" } else { "show" };
+    let Some(listener) = crate::instance::claim(message)? else {
+        return Ok(());
+    };
+    let core = Core::start(&Profile::active(), tray_only);
+    crate::instance::listen(listener, core.clone());
     let tray = crate::tray::spawn(core.clone());
+    if tray_only {
+        if !tray {
+            anyhow::bail!("System tray unavailable. Start F75 Studio after the desktop panel is ready, or launch without --tray.");
+        }
+        if !core.wait_for_window() {
+            core.stop_live();
+            core.flush(Duration::from_secs(3));
+            return Ok(());
+        }
+    }
     loop {
         window(core.clone())?;
         core.window_closed();

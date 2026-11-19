@@ -68,14 +68,14 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn start(pr: &Profile) -> Arc<Core> {
-        let (core, jobs, events) = Self::new(pr);
+    pub fn start(pr: &Profile, tray_only: bool) -> Arc<Core> {
+        let (core, jobs, events) = Self::new(pr, tray_only);
         let shared = core.clone();
         std::thread::spawn(move || worker(jobs, events, shared));
         core
     }
 
-    fn new(pr: &Profile) -> (Arc<Self>, Receiver<Job>, Sender<Event>) {
+    fn new(pr: &Profile, tray_only: bool) -> (Arc<Self>, Receiver<Job>, Sender<Event>) {
         let (jt, jr) = channel();
         let (et, er) = channel();
         let core = Arc::new(Core {
@@ -102,7 +102,7 @@ impl Core {
             ctx: Mutex::new(None),
             profile_changed: AtomicBool::new(false),
             tray_refresh: Mutex::new(None),
-            window: Mutex::new(WindowState::default()),
+            window: Mutex::new(if tray_only { WindowState::hidden() } else { WindowState::default() }),
             window_changed: Condvar::new(),
         });
         (core, jr, et)
@@ -753,7 +753,7 @@ mod settings_tests {
     use super::*;
 
     fn receiver_worker(online: bool) -> Worker {
-        let (core, _, tx) = Core::new(&Profile::new("test"));
+        let (core, _, tx) = Core::new(&Profile::new("test"), false);
         let mut worker = Worker::new(core, tx);
         worker.kb = Some(if online {
             F75::dry_run(Link::Receiver)
