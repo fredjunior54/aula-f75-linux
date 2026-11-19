@@ -5,6 +5,7 @@ use crate::device::F75;
 use crate::fx::{self, Fx};
 use crate::macros;
 use crate::protocol::{self as p, Link, EFFECTS, LED_COUNT};
+use crate::settings::{Change, Settings, reset_allowed};
 use crate::state::{self, MacroDef, Profile};
 use crate::window_state::{WindowAction, WindowState};
 use eframe::egui;
@@ -57,6 +58,8 @@ pub struct Core {
     pub frame: Mutex<Option<Colours>>,
     pub bands: Mutex<[f32; BANDS]>,
     pub link: Mutex<Option<Link>>,
+    pub settings: Mutex<Option<Settings>>,
+    pub reset_session: Mutex<Option<u64>>,
     pub ctx: Mutex<Option<egui::Context>>,
     pub profile_changed: AtomicBool,
     pub tray_refresh: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -66,6 +69,13 @@ pub struct Core {
 
 impl Core {
     pub fn start(pr: &Profile) -> Arc<Core> {
+        let (core, jobs, events) = Self::new(pr);
+        let shared = core.clone();
+        std::thread::spawn(move || worker(jobs, events, shared));
+        core
+    }
+
+    fn new(pr: &Profile) -> (Arc<Self>, Receiver<Job>, Sender<Event>) {
         let (jt, jr) = channel();
         let (et, er) = channel();
         let core = Arc::new(Core {
@@ -87,15 +97,15 @@ impl Core {
             frame: Mutex::new(None),
             bands: Mutex::new([0.0; BANDS]),
             link: Mutex::new(None),
+            settings: Mutex::new(None),
+            reset_session: Mutex::new(None),
             ctx: Mutex::new(None),
             profile_changed: AtomicBool::new(false),
             tray_refresh: Mutex::new(None),
             window: Mutex::new(WindowState::default()),
             window_changed: Condvar::new(),
         });
-        let c = core.clone();
-        std::thread::spawn(move || worker(jr, et, c));
-        core
+        (core, jr, et)
     }
 
     pub fn send(&self, job: Job) {
@@ -208,7 +218,8 @@ pub enum Job {
     Poll,
     Effect { mode: u8, brightness: u8, speed: u8, colour: u8 },
     PerKey { colours: Box<Colours>, brightness: u8 },
-    Sleep(u16),
+    SetSetting(Change),
+    FactoryReset(u64),
     SetSideLight(p::SideLightMode),
     Frame(Box<Colours>),
     LoadKeymap(u8),
@@ -224,9 +235,11 @@ pub enum Event {
     Connected(Link),
     Lost(String),
     Online(bool),
+    SettingFinished(Option<Change>),
+    ResetFinished(Result<(), String>),
     SideLightRead(u8),
     SideLightSaved(Option<p::SideLightMode>),
-    Block { mode: usize, brightness: u8, speed: u8, colour: u8, sleep: u16 },
+    Block { mode: usize, brightness: u8, speed: u8, colour: u8 },
     Keymap { layer: u8, codes: Vec<[u8; 4]>, backup: Vec<[u8; 4]> },
     Done(String),
     Error(String),
@@ -236,6 +249,8 @@ struct Worker {
     core: Arc<Core>,
     last_online: std::time::Instant,
     online: Option<bool>,
+    session: u64,
+    resetting: Option<Instant>,
     kb: Option<F75>,
     keymaps: HashMap<u8, Vec<u8>>,
     backups: HashMap<u8, Vec<u8>>,
@@ -255,6 +270,8 @@ impl Worker {
             // F75_STUDIO_DRY=wired|24g: pretend a keyboard is connected (screenshots without hardware)
             let mut kb = match std::env::var("F75_STUDIO_DRY").as_deref() {
                 Ok("wired") => F75::dry_run(Link::Wired),
+                Ok("bluetooth") => F75::dry_run(Link::Bluetooth),
+                Ok("24g-offline") => F75::dry_offline_receiver(),
                 Ok(_) => F75::dry_run(Link::Receiver),
                 Err(_) => F75::open()?,
             };
@@ -263,14 +280,12 @@ impl Worker {
             self.keymaps.clear();
             self.backups.clear();
             self.held = false;
-            self.online = kb.online().ok();
-            if let Some(online) = self.online {
-                self.last_online = Instant::now();
-                let _ = self.tx.send(Event::Online(online));
+            self.online = None;
+            if let Ok(online) = kb.online() {
+                self.report_online(kb.link, online);
                 if online {
-                    // While streaming, the firmware brightness is held at 9.
                     let streaming = self.core.live.lock().unwrap().streaming();
-                    Self::sync_led_block(&mut kb, &self.tx, !streaming);
+                    Self::sync_led_block(&mut kb, &self.core, &self.tx, !streaming);
                 }
             }
             self.kb = Some(kb);
@@ -278,13 +293,39 @@ impl Worker {
         Ok(self.kb.as_mut().unwrap())
     }
 
-    fn sync_led_block(kb: &mut F75, tx: &Sender<Event>, include_effect: bool) {
+    fn report_online(&mut self, link: Link, online: bool) {
+        self.last_online = Instant::now();
+        if self.online != Some(online) {
+            self.session = self.session.wrapping_add(1);
+        }
+        self.online = Some(online);
+        *self.core.reset_session.lock().unwrap() =
+            (self.resetting.is_none() && reset_allowed(Some(link), online)).then_some(self.session);
+        if !online {
+            *self.core.settings.lock().unwrap() = None;
+        }
+        let _ = self.tx.send(Event::Online(online));
+    }
+
+    fn disconnect(&mut self) {
+        self.kb = None;
+        self.online = None;
+        *self.core.link.lock().unwrap() = None;
+        *self.core.settings.lock().unwrap() = None;
+        *self.core.reset_session.lock().unwrap() = None;
+        self.keymaps.clear();
+        self.backups.clear();
+        self.held = false;
+    }
+
+    fn sync_led_block(kb: &mut F75, core: &Core, tx: &Sender<Event>, include_effect: bool) {
         if kb.link == Link::Bluetooth {
             return;
         }
         let Ok(block) = kb.get_led_block() else {
             return;
         };
+        *core.settings.lock().unwrap() = Settings::read(&block);
         if let Some(value) = p::side_light_from_block(&block) {
             let _ = tx.send(Event::SideLightRead(value));
         }
@@ -292,14 +333,11 @@ impl Worker {
             && !kb.dry()
             && let Some((mode, brightness, speed, colour)) = p::effect_from_block(&block)
         {
-            let hw = block[p::SLEEP_OFFSET];
-            let sleep = p::SLEEP.iter().find(|s| s.1 == hw).map_or(300, |s| s.0);
             let _ = tx.send(Event::Block {
                 mode,
                 brightness,
                 speed,
                 colour,
-                sleep,
             });
         }
     }
@@ -330,6 +368,30 @@ impl Worker {
     }
 
     fn run(&mut self, job: Job) -> anyhow::Result<Option<String>> {
+        if let Some(until) = self.resetting {
+            match job {
+                Job::Flush(done) => {
+                    let _ = done.send(());
+                }
+                Job::Poll if Instant::now() >= until => {
+                    let core = self.core.clone();
+                    let tx = self.tx.clone();
+                    if self.online == Some(true) {
+                        Self::sync_led_block(self.ensure()?, &core, &tx, true);
+                    } else {
+                        self.disconnect();
+                        self.ensure()?;
+                    }
+                    if self.online == Some(true) && self.core.settings.lock().unwrap().is_some() {
+                        self.resetting = None;
+                        self.report_online(self.kb.as_ref().unwrap().link, true);
+                    }
+                }
+                Job::Poll => {}
+                _ => anyhow::bail!("Waiting for the keyboard after factory reset"),
+            }
+            return Ok(None);
+        }
         Ok(match job {
             Job::Poll => {
                 // Hotplug: Bluetooth/cable have no I/O on poll, so check the device list itself.
@@ -339,40 +401,76 @@ impl Worker {
                     let still_here = present.iter().any(|(l, p)| *l == kb.link && *p == kb.path);
                     let best = present.first().map(|(l, _)| *l);
                     if !still_here || best != Some(kb.link) {
-                        self.kb = None;
-                        *self.core.link.lock().unwrap() = None;
+                        self.disconnect();
                         let _ = self.tx.send(Event::Lost(if still_here { "switching connection…".into() } else { "keyboard disconnected".into() }));
                     }
                 }
                 // radio traffic can swallow key releases on 2.4G (auto-repeat), so ask rarely
                 self.ensure()?;
                 let due = self.last_online.elapsed() > Duration::from_secs(20);
-                if (self.online.is_none() || due)
-                    && let Some(kb) = self.kb.as_mut()
-                {
-                    let online = kb.online()?;
-                    self.last_online = Instant::now();
-                    let _ = self.tx.send(Event::Online(online));
-                    if online && self.online != Some(true) {
-                        Self::sync_led_block(kb, &self.tx, false);
+                if self.online.is_none() || due {
+                    let kb = self.kb.as_mut().unwrap();
+                    let link = kb.link;
+                    let online = kb.online();
+                    let waking = self.online != Some(true);
+                    self.report_online(link, online.as_ref().is_ok_and(|value| *value));
+                    if online? && (waking || self.core.settings.lock().unwrap().is_none()) {
+                        Self::sync_led_block(
+                            self.kb.as_mut().unwrap(),
+                            &self.core,
+                            &self.tx,
+                            false,
+                        );
                     }
-                    self.online = Some(online);
                 }
                 None
             }
             Job::Effect { mode, brightness, speed, colour } => {
                 self.held = false;
                 self.ensure()?.set_effect(mode, brightness, speed, colour)?;
+                if let Some(settings) = self.core.settings.lock().unwrap().as_mut() {
+                    settings.brightness = (mode != 0).then_some(brightness);
+                }
                 Some("Lighting updated".into())
             }
             Job::PerKey { colours, brightness } => {
                 self.held = false;
                 self.ensure()?.set_per_key(&colours, brightness)?;
+                if let Some(settings) = self.core.settings.lock().unwrap().as_mut() {
+                    settings.brightness = Some(brightness);
+                }
                 Some("Per-key colours saved to keyboard".into())
             }
-            Job::Sleep(s) => {
-                self.ensure()?.set_sleep(s)?;
-                Some(if s == 0 { "Sleep disabled - lights stay on".into() } else { format!("Sleep after {}", sleep_label(s)) })
+            Job::SetSetting(change) => {
+                anyhow::ensure!(self.online == Some(true), "Keyboard is not online");
+                let block = self.ensure()?.set_setting(change)?;
+                *self.core.settings.lock().unwrap() = Settings::read(&block);
+                None
+            }
+            Job::FactoryReset(session) => {
+                anyhow::ensure!(
+                    *self.core.reset_session.lock().unwrap() == Some(session),
+                    "Keyboard connection changed - reset cancelled"
+                );
+                let result = self
+                    .kb
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("Keyboard disconnected - reset cancelled"))?
+                    .factory_reset();
+                if let Err(error) = result {
+                    self.disconnect();
+                    let _ = self.tx.send(Event::Lost(
+                        "Keyboard connection could not be verified".into(),
+                    ));
+                    return Err(error);
+                }
+                self.disconnect();
+                let mut live = self.core.live.lock().unwrap();
+                live.fx = None;
+                live.audio = false;
+                drop(live);
+                self.resetting = Some(Instant::now() + Duration::from_secs(5));
+                None
             }
             Job::SetSideLight(mode) => {
                 self.ensure()?.set_side_light(mode)?;
@@ -449,7 +547,8 @@ impl Worker {
                     } else {
                         kb.set_effect(pr.mode, pr.brightness, pr.speed, pr.colour)?;
                     }
-                    kb.set_sleep(pr.sleep)?;
+                    let block = kb.set_setting(Change::Sleep(pr.sleep))?;
+                    *self.core.settings.lock().unwrap() = Settings::read(&block);
                 }
                 // key layouts (missing = factory) + macros; skipped if the layout read looks wrong.
                 // Macros only take over the cable: on 2.4G the macro keys are left as they are.
@@ -497,14 +596,31 @@ pub fn fx_by_name(n: &str) -> Option<Fx> {
 pub fn sleep_label(s: u16) -> String {
     match s {
         0 => "Never".into(),
-        s if s % 60 == 0 => format!("{} min", s / 60),
-        s => format!("{:.1} min", s as f32 / 60.0),
+        s if s.is_multiple_of(60) => format!("{} min", s / 60),
+        s => format!("{} min {} s", s / 60, s % 60),
     }
 }
 
 impl Worker {
     /// Runs a job; a failure only counts as "disconnected" if the device node is really gone.
     fn handle(&mut self, job: Job) -> Option<Event> {
+        match job {
+            Job::SetSetting(change) => {
+                return match self.run(job) {
+                    Ok(_) => Some(Event::SettingFinished(Some(change))),
+                    Err(error) => {
+                        let _ = self.tx.send(Event::SettingFinished(None));
+                        Some(Event::Error(format!("{error:#}")))
+                    }
+                };
+            }
+            Job::FactoryReset(_) => {
+                return Some(Event::ResetFinished(
+                    self.run(job).map(|_| ()).map_err(|e| format!("{e:#}")),
+                ));
+            }
+            _ => {}
+        }
         let was_connected = self.kb.is_some();
         let side_light = match &job {
             Job::SetSideLight(mode) => Some(*mode),
@@ -527,8 +643,7 @@ impl Worker {
         let msg = format!("{e:#}");
         let present = self.kb.as_ref().is_some_and(|k| k.dry() || F75::detect().iter().any(|(l, p)| *l == k.link && *p == k.path));
         if !present || !was_connected {
-            self.kb = None;
-            *self.core.link.lock().unwrap() = None;
+            self.disconnect();
             Event::Lost(msg)
         } else {
             Event::Error(msg)
@@ -536,17 +651,25 @@ impl Worker {
     }
 }
 
+impl Worker {
+    fn new(core: Arc<Core>, tx: Sender<Event>) -> Self {
+        Self {
+            core,
+            last_online: Instant::now(),
+            online: None,
+            session: 0,
+            resetting: None,
+            kb: None,
+            keymaps: HashMap::new(),
+            backups: HashMap::new(),
+            tx,
+            held: false,
+        }
+    }
+}
+
 fn worker(rx: Receiver<Job>, tx: Sender<Event>, core: Arc<Core>) {
-    let mut w = Worker {
-        core: core.clone(),
-        last_online: Instant::now(),
-        online: None,
-        kb: None,
-        keymaps: HashMap::new(),
-        backups: HashMap::new(),
-        tx: tx.clone(),
-        held: false,
-    };
+    let mut w = Worker::new(core.clone(), tx.clone());
     let (mut engine, mut audio, t0) = (fx::Engine::default(), None::<Audio>, Instant::now());
     let mut last_poll = Instant::now() - Duration::from_secs(60);
     let (mut music, mut music_at, mut music_frame) = (crate::aula_music::Music::default(), Instant::now(), [[0u8; 3]; LED_COUNT]);
@@ -622,5 +745,62 @@ fn worker(rx: Receiver<Job>, tx: Sender<Event>, core: Arc<Core>) {
                 core.repaint();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    fn receiver_worker(online: bool) -> Worker {
+        let (core, _, tx) = Core::new(&Profile::new("test"));
+        let mut worker = Worker::new(core, tx);
+        worker.kb = Some(if online {
+            F75::dry_run(Link::Receiver)
+        } else {
+            F75::dry_offline_receiver()
+        });
+        worker.report_online(Link::Receiver, online);
+        worker
+    }
+
+    #[test]
+    fn reset_refuses_a_stale_confirmation_and_checks_again_before_sending() {
+        let mut worker = receiver_worker(true);
+        let confirmed = worker.session;
+        worker.report_online(Link::Receiver, false);
+        worker.report_online(Link::Receiver, true);
+        assert!(worker.run(Job::FactoryReset(confirmed)).is_err());
+        assert!(worker.kb.is_some());
+        assert!(worker.resetting.is_none());
+
+        let mut worker = receiver_worker(false);
+        worker.report_online(Link::Receiver, true); // Receiver went offline since last poll.
+        assert!(worker.run(Job::FactoryReset(worker.session)).is_err());
+        assert!(worker.resetting.is_none());
+        assert!(worker.core.reset_session.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn reset_clears_caches_and_discards_queued_writes_while_rebooting() -> anyhow::Result<()> {
+        let mut worker = receiver_worker(true);
+        worker.keymaps.insert(0, vec![0]);
+        worker.backups.insert(0, vec![0]);
+        worker.core.live.lock().unwrap().fx = Some(Fx::Wave);
+        worker.run(Job::FactoryReset(worker.session))?;
+        assert!(worker.resetting.is_some());
+        assert!(worker.kb.is_none());
+        assert!(worker.keymaps.is_empty());
+        assert!(worker.backups.is_empty());
+        assert!(!worker.core.live.lock().unwrap().streaming());
+        assert!(worker.core.reset_session.lock().unwrap().is_none());
+        assert!(worker.run(Job::SetSetting(Change::WinLock(true))).is_err());
+        assert!(
+            worker
+                .run(Job::ApplyProfile(Box::new(Profile::new("test"))))
+                .is_err()
+        );
+        assert!(worker.kb.is_none());
+        Ok(())
     }
 }

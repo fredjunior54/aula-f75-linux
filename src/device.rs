@@ -15,7 +15,8 @@ They are stored on the keyboard and stay active over Bluetooth.";
 
 pub struct F75 {
     dev: Option<HidDevice>, // None = dry run
-    simulated_side_light: p::SideLightMode,
+    simulated_led: [u8; p::LED_BLOCK_LEN],
+    simulated_online: bool,
     pub link: Link,
     pub cmds: Cmds,
     pub log: Vec<String>,
@@ -55,7 +56,8 @@ impl F75 {
             .with_context(|| format!("cannot open {path} ({}) - click Fix permissions in the app or run `f75-studio fix-permissions`", link.name()))?;
         Ok(Self {
             dev: Some(dev),
-            simulated_side_light: p::SideLightMode::Off,
+            simulated_led: [0; p::LED_BLOCK_LEN],
+            simulated_online: false,
             link,
             cmds: p::cmds(link),
             log: vec![format!("{} via {path}", link.name())],
@@ -65,15 +67,26 @@ impl F75 {
     }
 
     pub fn dry_run(link: Link) -> Self {
+        let mut simulated_led = [0; p::LED_BLOCK_LEN];
+        p::edit_led_block(&mut simulated_led, p::CUSTOM_MODE, 9, 0, 7);
+        simulated_led[p::SLEEP_OFFSET] = 10;
+        simulated_led[126..].copy_from_slice(&[0x5a, 0xa5]);
         Self {
             dev: None,
-            simulated_side_light: p::SideLightMode::Off,
+            simulated_led,
+            simulated_online: true,
             link,
             cmds: p::cmds(link),
             log: vec![format!("dry run ({})", link.name())],
             path: String::new(),
             trace: None,
         }
+    }
+
+    pub fn dry_offline_receiver() -> Self {
+        let mut keyboard = Self::dry_run(Link::Receiver);
+        keyboard.simulated_online = false;
+        keyboard
     }
 
     pub fn dry(&self) -> bool {
@@ -288,14 +301,18 @@ impl F75 {
             return Ok(true);
         }
         let reply = self.wireless_read(p::WIRELESS_ONLINE, 0, 1)?;
-        Ok(self.dry() || reply[0] != 0)
+        Ok(if self.dry() {
+            self.simulated_online
+        } else {
+            reply.first() == Some(&1)
+        })
     }
 
     pub fn get_led_block(&mut self) -> Result<Vec<u8>> {
         let led = self.cmds.led;
         let mut b = self.read(led, 0, p::LED_BLOCK_LEN)?;
         if self.dry() {
-            p::edit_side_light(&mut b, self.simulated_side_light);
+            b.copy_from_slice(&self.simulated_led);
         } else if !p::led_block_valid(&b) {
             bail!("LED block signature 5A A5 missing - refusing to write");
         }
@@ -303,29 +320,60 @@ impl F75 {
     }
 
     /// Read-modify-write of the 128-byte LED block, like OemDrv.
-    fn edit_block(&mut self, f: impl FnOnce(&mut Vec<u8>)) -> Result<()> {
-        let mut b = self.get_led_block()?;
-        f(&mut b);
-        let led = self.cmds.led;
-        self.write(led, 0, &b, 15)
+    fn edit_block(&mut self, edit: impl FnOnce(&mut [u8]) -> Result<()>) -> Result<Vec<u8>> {
+        let mut block = self.get_led_block()?;
+        edit(&mut block)?;
+        self.write(self.cmds.led, 0, &block, 15)?;
+        if self.dry() {
+            self.simulated_led.copy_from_slice(&block);
+        }
+        Ok(block)
+    }
+
+    pub fn set_setting(&mut self, change: crate::settings::Change) -> Result<Vec<u8>> {
+        self.edit_block(|block| change.apply(block))
+    }
+
+    pub fn factory_reset(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.link == Link::Receiver,
+            "Factory reset requires the 2.4G receiver"
+        );
+        anyhow::ensure!(
+            self.online()?,
+            "Keyboard is no longer online - reset cancelled"
+        );
+        anyhow::ensure!(
+            self.dry()
+                || Self::detect()
+                    .first()
+                    .is_some_and(|(link, path)| { *link == Link::Receiver && *path == self.path }),
+            "Keyboard connection changed - reset cancelled"
+        );
+        // Reset is sent once, without entering the normal ACK/retry path.
+        self.send20(&p::write_packets(0x06, 0, &[1])[0])
     }
 
     pub fn set_effect(&mut self, mode: u8, brightness: u8, speed: u8, colour: u8) -> Result<()> {
-        self.edit_block(|b| p::edit_led_block(b, mode, brightness, speed, colour))
+        self.edit_block(|block| {
+            p::edit_led_block(block, mode, brightness, speed, colour);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn set_side_light(&mut self, mode: p::SideLightMode) -> Result<()> {
-        self.edit_block(|b| p::edit_side_light(b, mode))?;
-        if self.dry() {
-            self.simulated_side_light = mode;
-        }
+        self.edit_block(|block| {
+            p::edit_side_light(block, mode);
+            Ok(())
+        })?;
         Ok(())
     }
 
     /// Seconds from protocol::SLEEP (0 = never).
     pub fn set_sleep(&mut self, seconds: u16) -> Result<()> {
-        let hw = p::SLEEP.iter().find(|s| s.0 == seconds).map(|s| s.1).unwrap_or(2);
-        self.edit_block(|b| b[p::SLEEP_OFFSET] = hw)
+        self.set_setting(crate::settings::Change::Sleep(seconds))?;
+        Ok(())
     }
 
     pub fn set_per_key(&mut self, colours: &[[u8; 3]; p::LED_COUNT], brightness: u8) -> Result<()> {
@@ -379,6 +427,37 @@ pub fn hex(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_sends_exactly_one_receiver_report_and_requires_online_receiver() -> Result<()> {
+        let mut receiver = F75::dry_run(Link::Receiver);
+        receiver.trace = Some(Vec::new());
+        receiver.factory_reset()?;
+        let trace = receiver.trace.unwrap();
+        assert_eq!(trace.len(), 2); // online query, then reset; no ACK traffic
+        assert!(trace[0].starts_with("> 13 07 "));
+        assert_eq!(
+            trace[1],
+            "> 13 06 01 00 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 1c"
+        );
+
+        for mut keyboard in [
+            F75::dry_run(Link::Wired),
+            F75::dry_run(Link::Bluetooth),
+            F75::dry_offline_receiver(),
+        ] {
+            keyboard.trace = Some(Vec::new());
+            assert!(keyboard.factory_reset().is_err());
+            assert!(
+                !keyboard
+                    .trace
+                    .unwrap()
+                    .iter()
+                    .any(|line| line.starts_with("> 13 06 "))
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn simulated_side_light_round_trips_over_both_links() -> Result<()> {
